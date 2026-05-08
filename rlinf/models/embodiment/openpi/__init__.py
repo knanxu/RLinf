@@ -40,8 +40,23 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         config_name, model_path=cfg.model_path, data_kwargs=data_kwargs
     )
 
-    actor_model_config = actor_train_config.model
-    actor_model_config = OpenPi0Config(**actor_model_config.__dict__)
+    # Dispatch: noise_method == "drift_dbpo" swaps in the DBPO model class,
+    # which adds the state-conditioned log-std head and replaces the flow
+    # denoise sample path with openpi's 1-NFE _sample_actions_drifting.
+    noise_method = getattr(cfg.openpi, "noise_method", "flow_sde")
+    use_dbpo = noise_method == "drift_dbpo"
+
+    if use_dbpo:
+        from rlinf.models.embodiment.openpi.openpi_dbpo_action_model import (
+            OpenPi0DBPOConfig,
+            OpenPi0DBPOForRLActionPrediction,
+        )
+        actor_model_config = actor_train_config.model
+        actor_model_config = OpenPi0DBPOConfig(**actor_model_config.__dict__)
+    else:
+        actor_model_config = actor_train_config.model
+        actor_model_config = OpenPi0Config(**actor_model_config.__dict__)
+
     override_model_config_kwargs = cfg.openpi
     if override_model_config_kwargs is not None:
         for key, val in override_model_config_kwargs.items():
@@ -59,9 +74,10 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         checkpoint_dir, "actor", "model_state_dict", "full_weights.pt"
     )
 
-    model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
-        actor_model_config
-    )
+    if use_dbpo:
+        model = OpenPi0DBPOForRLActionPrediction(actor_model_config)
+    else:
+        model = OpenPi0ForRLActionPrediction(actor_model_config)
     # train expert only
     if actor_model_config.train_expert_only:
         model.freeze_vlm()

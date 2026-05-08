@@ -1466,6 +1466,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
                         "value_clip": self.cfg.algorithm.get("value_clip", None),
                         "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                        # BPO actor loss (bpo_actor / bpo_actor_critic) hyperparams.
+                        # Forwarded unconditionally; PPO losses ignore extra **kwargs.
+                        "bpo_epsilon": self.cfg.algorithm.get("bpo_epsilon", 0.2),
+                        "bpo_lambda": self.cfg.algorithm.get("bpo_lambda", 1.0e-3),
+                        "bpo_alpha1": self.cfg.algorithm.get("bpo_alpha1", 0.0),
                         "loss_mask": loss_mask,
                         "loss_mask_sum": loss_mask_sum,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
