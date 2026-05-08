@@ -166,9 +166,7 @@ matters because `bpo_lambda` is dimensional — if we divide advantages by
 their std before feeding them into `sigmoid(adv / lambda)` we destroy the
 intended scale of the target ratio. Leave advantage normalization off.
 
-## What is *not* done yet and why
-
-### Anchor loss (Eq. 16, `mu_theta(o,z) - mu_theta_bar(o,z)`)
+## Anchor loss (Gao et al. Eq. 16)
 
 Wired through `actor.model.openpi.dbpo_anchor_coef` (float, default 1.0). When
 set, the actor worker snapshots the BC checkpoint with
@@ -188,22 +186,13 @@ clip alone. Paper ablation (Table II, "w/o anc.") shows +15 pts success on
 RoboMimic when anchor is on, so leave it on unless you're actively probing
 the no-anchor regime.
 
-### Weight syncer for drift path
+## Weight syncer note
 
-The yaml uses `weight_syncer/patch_syncer` which RLinf's flow-matching PPO
-path already uses. The syncer only sees parameter dicts, so the drift model's
-new `logstd_head` flows through it unchanged. If rollout / actor processes
-diverge on the value head or log-std bias, re-check by running
+The yaml uses `weight_syncer/patch_syncer`, same path RLinf's flow-matching
+PPO already uses. The syncer only sees parameter dicts, so the drift model's
+new `logstd_head` flows through unchanged. If rollout / actor processes
+ever diverge on the value head or log-std bias, re-check by running
 `rlinf/hybrid_engines/weight_syncer/patch_syncer.py` with logging enabled.
-
-### `ratio_clip_eps` collision
-
-`fsdp_actor_worker.py:735` reads `self.cfg.algorithm.ratio_clip_eps` for a
-different (older) loss path. Our BPO yaml does not set it, so the field is
-missing; the key isn't used by `bpo_actor_critic`, but if another code path
-in the worker also reaches the same line with BPO loss selected we would
-KeyError. If you see that at startup, add `ratio_clip_eps: 0.2` to the
-algorithm block as a no-op.
 
 ## Quick self-test without running a full job
 
@@ -244,14 +233,6 @@ print(float(loss), sorted(metrics.keys()))
    is very close to the BC policy. Raise `dbpo_max_logprob_std` or drop the
    init log-std to increase exploration if you see success rate plateau at
    the BC baseline.
-
-4. **Prefix pool dtype mismatch on pi0.5**. `_sample_actions_drifting`
-   (openpi) already casts prefix_out -> float32 before the pooling; the
-   cond_emb reaching `LogStdHead` is fp32. If the LogStdHead has been
-   cast to bf16 by FSDP mixed precision, input/param dtype will mismatch.
-   The `LogStdHead.forward` expands the bias to match cond_emb.dtype to
-   defend against this. If you still see dtype errors, wrap the
-   `self.proj(cond_emb)` call in `.to(cond_emb.dtype)` for weights.
 
 ## End-to-end pipeline: base -> drifting SFT -> DBPO/BPO RL
 
