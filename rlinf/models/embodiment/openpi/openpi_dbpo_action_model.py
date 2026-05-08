@@ -322,4 +322,63 @@ class OpenPi0DBPOForRLActionPrediction(OpenPi0ForRLActionPrediction):
         logprob = logprob_full[:, None]  # [B, 1, H, D]
         entropy = entropy_full[:, None]  # [B, 1, H, D]
         value = value[:, None]           # [B, 1]
-        return logprob, value, entropy
+        # Expose mean for anchor-loss consumers. Rollout-time anchor does
+        # not consume this, but default_forward propagates it through.
+        return logprob, value, entropy, mean
+
+    # ------------------------------------------------------------------
+    # Override default_forward to propagate mean (for anchor loss)
+    # ------------------------------------------------------------------
+    def default_forward(
+        self,
+        forward_inputs: dict,
+        **kwargs,
+    ) -> dict:
+        """Mirrors the parent but unpacks the 4-tuple (logprob, value, entropy, mean)
+        and exposes mean in the output dict. Callers that do not consume mean
+        just ignore it; anchor-loss-aware trainers read it.
+        """
+        from openpi.models import model as _model
+
+        compute_values = kwargs.get("compute_values", False)
+        chains = forward_inputs["chains"]
+        denoise_inds = forward_inputs["denoise_inds"]
+
+        observation = self.input_transform(forward_inputs, transpose=False)
+        observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+        device = chains.device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+
+        log_probs, value_t, entropy, mean = self.get_log_prob_value(
+            images, img_masks, lang_tokens, lang_masks, state,
+            chains, denoise_inds, compute_values,
+        )
+        log_probs = log_probs[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        entropy = entropy[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+
+        log_probs = log_probs.mean(dim=1)
+        entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[:, None]
+        value_t = value_t.mean(dim=-1, keepdim=False)
+
+        return {
+            "logprobs": log_probs,
+            "values": value_t,
+            "entropy": entropy,
+            # Exposed for DBPO anchor loss. The trainer opts in via
+            # return_dbpo_extras=True when dbpo_anchor_coef > 0; otherwise we
+            # drop the extra tensor to keep per-mbs memory flat.
+            **(
+                {"dbpo_mean": mean}
+                if kwargs.get("return_dbpo_extras", False)
+                else {}
+            ),
+        }

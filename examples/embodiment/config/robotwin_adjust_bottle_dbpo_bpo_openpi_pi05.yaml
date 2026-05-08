@@ -193,7 +193,7 @@ actor:
       dbpo_min_sampling_std: 0.03
       dbpo_randn_clip: 3.0
       dbpo_freeze_logstd_cond: True
-      dbpo_anchor_coef: 0.0
+      dbpo_anchor_coef: 1.0
 
   optim:
     lr: 5.0e-06

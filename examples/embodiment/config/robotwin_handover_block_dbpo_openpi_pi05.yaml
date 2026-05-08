@@ -200,8 +200,13 @@ actor:
       # Start with a state-independent log-std (bias-only) for stability.
       # Flip to False to let sigma condition on the prefix features.
       dbpo_freeze_logstd_cond: True
-      # Anchor loss is not wired into the PPO loss path yet; kept as 0.
-      dbpo_anchor_coef: 0.0
+      # Anchor loss (Gao et al. Eq. 16): lambda_anchor * MSE(mu, mu_old).
+      # When > 0 the actor worker snapshots the BC checkpoint on CPU and does
+      # a second forward under frozen weights per minibatch. Doubles GPU peak
+      # briefly during the swap but keeps the policy close to the drifting
+      # manifold (paper ablation: ~+15 pts success on RoboMimic). Set to 0 to
+      # disable and rely on the tight ratio clip alone.
+      dbpo_anchor_coef: 1.0
 
   optim:
     lr: 5.0e-06

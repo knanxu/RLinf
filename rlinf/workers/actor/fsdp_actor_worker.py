@@ -160,6 +160,14 @@ class FSDPActor(FSDPModelManager, Worker):
         self.reinpp_kl_beta = cfg.algorithm.get("reinpp_kl_beta", 0.0)
         self.combine_reference_model = cfg.actor.get("combine_reference_model", True)
 
+        # DBPO anchor loss (Gao et al. Eq. 16). Coefficient is read from the
+        # *model* config because that is where the rest of the DBPO knobs live.
+        # A non-zero value triggers a second forward under the frozen
+        # pretrained weights to compute mu_old per mini-batch.
+        self.dbpo_anchor_coef = float(
+            cfg.actor.model.get("openpi", {}).get("dbpo_anchor_coef", 0.0)
+        )
+
         self.total_batch_size_per_dp = (
             cfg.data.rollout_batch_size * cfg.algorithm.group_size // self._world_size
         )
@@ -214,6 +222,16 @@ class FSDPActor(FSDPModelManager, Worker):
         ) and self.combine_reference_model:
             self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
             self.offload_model_buffer = {}
+        # DBPO anchor: snapshot frozen pretrained weights once at init. We reuse
+        # the same cpu_weight_swap mechanism as the KL reference path, but the
+        # state dict needs to live independently when both anchor and KL are on.
+        if self.dbpo_anchor_coef > 0 and self.combine_reference_model:
+            if self.ref_policy_state_dict is None:
+                self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+                self.offload_model_buffer = {}
+            self._dbpo_anchor_state_dict = self.ref_policy_state_dict
+        else:
+            self._dbpo_anchor_state_dict = None
 
         if self.enable_offload and not self.is_pipeline:
             self.offload_param_and_grad()
@@ -1435,6 +1453,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
+                    # Anchor loss needs mu_theta_bar(o, z) under frozen weights,
+                    # and the same (images, z) feeds the current-param forward
+                    # that already runs inside self.model(...). Ask the model to
+                    # return those extras so we can do the second (frozen)
+                    # forward right after.
+                    dbpo_anchor_on = (
+                        self.dbpo_anchor_coef > 0
+                        and self._dbpo_anchor_state_dict is not None
+                    )
+
                     with self.amp_context:
                         output_dict = self.model(
                             forward_inputs=forward_inputs,
@@ -1442,6 +1470,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
                             compute_values=compute_values,
                             use_cache=False,
+                            return_dbpo_extras=dbpo_anchor_on,
                             **kwargs,
                         )
 
@@ -1500,6 +1529,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     if self.enable_sft_co_train:
                         self._train_sft_epoch(metrics_data, loss)
+
+                    # DBPO anchor loss: second forward under frozen pretrained
+                    # weights to obtain mu_old(o, z), then MSE to the current
+                    # mu(o, z) retained in output_dict["dbpo_mean"].
+                    if dbpo_anchor_on:
+                        cur_mean = output_dict["dbpo_mean"]
+                        # For FSDP safety the frozen forward goes through the
+                        # wrapped model's __call__ so parameter gather hooks
+                        # fire correctly. cpu_weight_swap restores the trainable
+                        # weights on exit.
+                        with cpu_weight_swap(
+                            self.model,
+                            self._dbpo_anchor_state_dict,
+                            self.offload_model_buffer,
+                        ):
+                            with torch.no_grad(), self.amp_context:
+                                frozen_out = self.model(
+                                    forward_inputs=forward_inputs,
+                                    compute_logprobs=False,
+                                    compute_entropy=False,
+                                    compute_values=False,
+                                    use_cache=False,
+                                    return_dbpo_extras=True,
+                                )
+                            mean_old = frozen_out["dbpo_mean"]
+                        anchor_loss = torch.nn.functional.mse_loss(
+                            cur_mean, mean_old.detach()
+                        )
+                        loss = loss + self.dbpo_anchor_coef * anchor_loss
+                        metrics_data["actor/dbpo_anchor_loss"] = (
+                            anchor_loss.detach().item()
+                        )
 
                     loss /= self.gradient_accumulation
                     with backward_ctx:

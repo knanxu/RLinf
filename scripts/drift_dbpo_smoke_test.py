@@ -304,13 +304,16 @@ def tier2_dbpo_shapes_and_replay() -> None:
     )
 
     with torch.no_grad():
-        logprob_replay, value_replay, entropy_replay = model.get_log_prob_value(
-            images, img_masks, lang_tokens, lang_masks, state,
-            chains=out["chains"], denoise_inds=out["denoise_inds"],
-            compute_values=True,
+        logprob_replay, value_replay, entropy_replay, mean_replay = (
+            model.get_log_prob_value(
+                images, img_masks, lang_tokens, lang_masks, state,
+                chains=out["chains"], denoise_inds=out["denoise_inds"],
+                compute_values=True,
+            )
         )
     assert logprob_replay.shape == (bsz, 1, pi0_cfg.action_horizon, pi0_cfg.action_dim)
     assert value_replay.shape == (bsz, 1)
+    assert mean_replay.shape == (bsz, pi0_cfg.action_horizon, pi0_cfg.action_dim)
     assert torch.isfinite(logprob_replay).all()
 
     # Trim replayed logprob to the executed (chunk, env_dim) slice and compare.

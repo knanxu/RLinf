@@ -149,7 +149,7 @@ Read: Gao et al. "Drift-Based Policy Optimization", Sec. IV.B.
 | `dbpo_min_sampling_std` | 0.03 | same | Floor for *sampling* std, independent of logprob sigma. |
 | `dbpo_randn_clip` | 3.0 | 3.0 | Truncates Gaussian noise at ±3 sigma per dim. |
 | `dbpo_freeze_logstd_cond` | True | False (DBPO paper) | True = per-dim bias only; False = learned per-state. Start True. |
-| `dbpo_anchor_coef` | 0.0 | 1.0 | Anchor loss (Eq. 16). Not wired into the PPO loss here — tight clip instead. |
+| `dbpo_anchor_coef` | 1.0 | 1.0 | Anchor loss (Eq. 16). See "Anchor loss" below. Set to 0 to disable. |
 
 ## BPO knobs
 
@@ -170,18 +170,23 @@ intended scale of the target ratio. Leave advantage normalization off.
 
 ### Anchor loss (Eq. 16, `mu_theta(o,z) - mu_theta_bar(o,z)`)
 
-Requires a frozen pretrained snapshot in memory alongside the trainable
-policy. At pi0.5 scale this doubles backbone memory. DBPO paper ablation
-(Table II, "w/o anc.") shows anchor gains +15 pts success on RoboMimic — so it
-matters — but first we want to verify the adapter loop is correct without
-this complication. Path to add later:
+Wired through `actor.model.openpi.dbpo_anchor_coef` (float, default 1.0). When
+set, the actor worker snapshots the BC checkpoint with
+`retrieve_model_state_dict_in_cpu` at init, and every minibatch runs a second
+forward under those frozen weights via `cpu_weight_swap` to obtain `mu_old`.
+The loss is `dbpo_anchor_coef * MSE(mu_theta(o, z), mu_theta_bar(o, z))`,
+added on top of the PPO/BPO policy+critic loss.
 
-1. In `DBPOPPOWrapper.__init__` keep a deepcopy `actor_old` on CPU offload.
-2. When computing loss, call `_drift_forward_from_tokens` once with frozen
-   weights (via `torch.no_grad` + temporary `load_state_dict`) to get
-   `mu_old`; drop this into an extra loss term `lambda_anchor * MSE(mu, mu_old)`.
-3. Expose `dbpo_anchor_coef` through the actor-worker kwargs the same way
-   `bpo_*` was exposed.
+Cost: roughly one extra backbone forward per microbatch (no grad, so only
+activations live transiently). Memory: one CPU-pinned copy of the full state
+dict (shared with the KL reference path when `kl_beta > 0`). On pi0.5 this is
+~4 GB per rank on CPU, negligible on GPU because the swap happens in place
+under `torch.no_grad`.
+
+Set `dbpo_anchor_coef: 0.0` in the yaml to disable and rely on a tight ratio
+clip alone. Paper ablation (Table II, "w/o anc.") shows +15 pts success on
+RoboMimic when anchor is on, so leave it on unless you're actively probing
+the no-anchor regime.
 
 ### Weight syncer for drift path
 
