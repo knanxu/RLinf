@@ -1,0 +1,117 @@
+# Drifting-loss SFT for Pi0.5 on RoboTwin (LeRobot v2.1 Parquet).
+#
+# This is the Stage-1 SFT that our drift-dbpo-bpo branch's Stage-2 RL
+# fine-tuning consumes. The only delta versus robotwin_sft_openpi_pi05.yaml
+# is actor.model.openpi.use_drifting_loss=True plus the three drifting knobs.
+#
+# OpenPi0Config inherits from Pi0Config so the four drifting_* fields below
+# are recognised fields on the dataclass. They flow through the yaml override
+# loop in rlinf/models/embodiment/openpi/__init__.py (get_model) unchanged.
+#
+# What you will get:
+#   * PI0Pytorch.forward(...) sees use_drifting_loss=True and dispatches to
+#     _forward_drifting (openpi zj-humanoid-drifting branch, pi0_pytorch.py).
+#   * _forward_drifting runs G=4 samples per label through the backbone,
+#     computes contrastive drift_loss (openpi models_pytorch/drifting_util.py),
+#     returns a per-batch scalar. RLinf's SFT trainer treats it as the
+#     standard imitation loss and backprops normally.
+#   * The saved checkpoint is a drifting-tuned Pi0.5. Stage-2 RL
+#     (DBPO/BPO) picks it up with noise_method="drift_dbpo".
+
+defaults:
+  - model/pi0_5@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0-7   # scale to 0-7 for 8-GPU; matches RLinf docs default.
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robotwin_sft_drifting_openpi_pi05"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: -1
+  max_steps: 30000
+  val_check_interval: -1
+  save_interval: 5000
+
+data:
+  # LeRobot v2.1 Parquet directory for the RoboTwin task. See
+  # docs/drift_dbpo_bpo_migration.md for how to convert RoboTwin demos.
+  train_data_paths: "/path/to/robotwin-lerobot/adjust_bottle"
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 64
+  seed: 0
+
+  model:
+    precision: null
+    # Stage-0 base checkpoint (JAX pi05_base → PyTorch, see migration doc).
+    # Stage-1 SFT output is what Stage-2 RL will load.
+    model_path: "/path/to/pi05_base_pytorch"
+    num_action_chunks: 50
+    action_dim: 14
+    add_value_head: False
+    openpi:
+      config_name: "pi05_aloha_robotwin"
+      detach_critic_input: True
+      num_images_in_input: 3
+      train_expert_only: False
+
+      # --- Drifting loss knobs. Read by Pi0Config (parent of OpenPi0Config),
+      # consumed inside PI0Pytorch.forward / _forward_drifting. ---
+      use_drifting_loss: True
+      drifting_gen_per_label: 4
+      # Multi-scale R values (openpi drifting_util). These are the same
+      # defaults we already use in openpi's RoboTwin drifting configs.
+      drifting_temperatures: [0.02, 0.05, 0.2]
+      drifting_per_timestep_loss: True
+
+  optim:
+    lr: 2.5e-5
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1e-10
+    clip_grad: 1.0
+    total_training_steps: 30000
+    lr_warmup_steps: 1000
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False   # openpi does not support gradient ckpt
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

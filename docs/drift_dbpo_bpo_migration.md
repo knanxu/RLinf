@@ -252,3 +252,346 @@ print(float(loss), sorted(metrics.keys()))
    The `LogStdHead.forward` expands the bias to match cond_emb.dtype to
    defend against this. If you still see dtype errors, wrap the
    `self.proj(cond_emb)` call in `.to(cond_emb.dtype)` for weights.
+
+## End-to-end pipeline: base -> drifting SFT -> DBPO/BPO RL
+
+This branch only provides the Stage-2 RL glue. Stage-0 base download, Stage-1
+drifting SFT, and data preparation all sit outside the changes. Here is the
+full recipe in one place so you do not have to re-derive it. Commands assume
+the official Docker image — see the "Docker" section below for setup.
+
+```
+  Stage 0        Stage 1                        Stage 2 (this branch)
+  +-------+      +------------------------+     +-------------------------+
+  |pi05   |----->|drifting SFT on RoboTwin|---->|DBPO/BPO RL on RoboTwin |
+  |base   |      |expert demonstrations   |     |(PPO clip or BPO)       |
+  |(JAX)  |      |(use_drifting_loss=True)|     |(drift_dbpo sampling)   |
+  +-------+      +------------------------+     +-------------------------+
+    |                      |                               |
+    v                      v                               v
+  jax->pytorch       pytorch ckpt w/            pytorch ckpt, 1-NFE
+  converter          drifting decision          drift inference + Gaussian
+                     boundary                   exploration + value head
+```
+
+### Stage 0: download and convert the base checkpoint
+
+```bash
+# 0.1 download JAX Orbax checkpoint (pi05_base is the flow-matching base;
+# pi0_base exists too but we're going the pi0.5 route).
+python - <<'PY'
+import openpi.shared.download as dl
+p = dl.maybe_download('gs://openpi-assets/checkpoints/pi05_base')
+print("downloaded to", p)
+PY
+
+# 0.2 convert to PyTorch safetensors.
+# config_name picks the *data config* that the converter uses to build the
+# Pi0Config; pi05_aloha_robotwin matches RoboTwin with Aloha embodiment.
+python rlinf/utils/ckpt_convertor/convert_openpi_jax_to_python.py \
+    --checkpoint_dir /opt/assets/.cache/openpi/pi05_base \
+    --output_path    /workspace/checkpoints/pi05_base_pytorch \
+    --config_name    pi05_aloha_robotwin \
+    --precision      bfloat16
+```
+
+Result: `/workspace/checkpoints/pi05_base_pytorch/` with `*.safetensors` and an
+`assets/` directory (with `norm_stats.json`). This is what Stage-1 SFT reads.
+
+### Stage 1: drifting SFT
+
+Use `examples/sft/config/robotwin_sft_drifting_openpi_pi05.yaml` (added on
+this branch). It is `robotwin_sft_openpi_pi05.yaml` with the four drifting
+knobs turned on:
+
+```yaml
+actor.model.openpi:
+  use_drifting_loss: True
+  drifting_gen_per_label: 4
+  drifting_temperatures: [0.02, 0.05, 0.2]
+  drifting_per_timestep_loss: True
+```
+
+The openpi dataclass `Pi0Config` already has these fields (your
+`zj-humanoid-drifting` branch added them). RLinf's yaml override loop in
+`rlinf/models/embodiment/openpi/__init__.py` copies them onto the instantiated
+model config without requiring RLinf-side code changes. So at SFT time,
+`PI0Pytorch.forward(observation, actions)` sees `use_drifting_loss=True` and
+dispatches to `_forward_drifting`, which computes the attraction-repulsion
+drift loss from `openpi/models_pytorch/drifting_util.py`.
+
+Launch:
+
+```bash
+cd /workspace/RLinf
+# Set data path first (see "RoboTwin expert data" below)
+# Edit examples/sft/config/robotwin_sft_drifting_openpi_pi05.yaml:
+#   data.train_data_paths: "/workspace/data/robotwin-lerobot/adjust_bottle"
+#   actor.model.model_path: "/workspace/checkpoints/pi05_base_pytorch"
+
+bash examples/sft/run_vla_sft.sh robotwin_sft_drifting_openpi_pi05
+```
+
+Output: `/workspace/results/robotwin_sft_drifting_openpi_pi05/<run-id>/checkpoints/last/`.
+That directory is what Stage-2 RL reads.
+
+### Stage 2: DBPO / BPO RL
+
+Point the RL yaml's `actor.model.model_path` at the SFT output. Then:
+
+```bash
+# DBPO + PPO clip
+bash examples/embodiment/run_embodiment.sh robotwin_adjust_bottle_dbpo_openpi_pi05 ALOHA
+
+# DBPO + BPO (once PPO version is known to improve)
+bash examples/embodiment/run_embodiment.sh robotwin_adjust_bottle_dbpo_bpo_openpi_pi05 ALOHA
+```
+
+## Docker
+
+RLinf ships a unified Dockerfile at `docker/Dockerfile` with per-env build
+targets. For RoboTwin we want `embodied-robotwin`, which installs three
+Python venvs (`openvla-oft`, `openpi`, `lingbotvla`) inside the image.
+
+### Build
+
+```bash
+cd /home/xukainan/RLinf
+docker build \
+    -f docker/Dockerfile \
+    --build-arg BUILD_TARGET=embodied-robotwin \
+    -t rlinf:embodied-robotwin \
+    .
+```
+
+The build runs `requirements/install.sh embodied --venv openpi --model openpi
+--env robotwin`, which in turn pins a specific version of openpi from PyPI.
+That is fine for stock RLinf, but **your drifting changes live in your
+openpi fork and are not on PyPI**. See "Using your openpi fork inside Docker"
+below.
+
+### Run
+
+The container expects the RLinf repo to be bind-mounted at `/workspace/RLinf`
+(or wherever you want) so your edits here are visible inside. A typical
+single-node launch:
+
+```bash
+docker run --rm -it --gpus all \
+    --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+    --shm-size=16g \
+    -v /home/xukainan/RLinf:/workspace/RLinf \
+    -v /home/xukainan/openpi:/workspace/openpi \
+    -v /home/xukainan/data:/workspace/data \
+    -v /home/xukainan/checkpoints:/workspace/checkpoints \
+    -v /home/xukainan/results:/workspace/results \
+    rlinf:embodied-robotwin \
+    bash
+```
+
+Inside the container:
+
+```bash
+# Switch into the openpi venv (this venv has the openpi-compatible torch,
+# flash-attn, jax-for-converter, etc.)
+source switch_env openpi
+
+# Re-install the mounted RLinf as editable so your drift-dbpo-bpo branch
+# takes precedence over whatever the image baked in.
+pip install -e /workspace/RLinf
+
+# Editable-install your openpi fork (zj-humanoid-drifting branch) so
+# _sample_actions_drifting(return_hidden=True) is available.
+pip install -e /workspace/openpi
+```
+
+Then run Stages 0-2 as shown above.
+
+### Using your openpi fork inside Docker
+
+Two ways. Pick one.
+
+**Option A — bind-mount and pip install -e (recommended for iteration):**
+see the `run` recipe above. The `-v /home/xukainan/openpi:/workspace/openpi`
+bind plus `pip install -e /workspace/openpi` swaps the PyPI openpi for your
+fork at runtime. Fast; no rebuild; you can edit code on the host and re-run
+without rebuilding the image.
+
+**Option B — bake into the image:** add a `RUN git clone -b zj-humanoid-drifting
+https://github.com/N0ne1eft/openpi /opt/openpi && source switch_env openpi
+&& pip install -e /opt/openpi` line after the RoboTwin install in the
+`embodied-robotwin-image` stage of `docker/Dockerfile`. Only worth doing
+once the openpi drifting code is stable.
+
+### Asset cache layout in the image
+
+`download_assets --dir /opt/assets --assets openpi` (which the Dockerfile
+already runs) populates `/opt/assets/.cache/openpi/` with openpi's public
+checkpoints, including `pi05_base`. The entrypoint then symlinks
+`~/.cache/openpi -> /opt/assets/.cache/openpi` so `openpi.shared.download`
+resolves those paths offline. So Stage-0's `maybe_download("pi05_base")`
+will return `/opt/assets/.cache/openpi/pi05_base` in the container without
+a second download.
+
+RoboTwin assets (the simulator side, separate from openpi) are downloaded
+by `bash script/_download_assets.sh` inside the RoboTwin repo — see the
+next section.
+
+## RoboTwin expert data
+
+RLinf does not ship RoboTwin expert demonstrations. You generate them
+from the RoboTwin simulator and convert to LeRobot v2.1 Parquet, which is
+the format RLinf's SFT pipeline consumes
+(`rlinf/models/embodiment/openpi/dataconfig/robotwin_aloha_dataconfig.py`).
+
+### 1. Clone the RoboTwin RLinf_support branch
+
+```bash
+cd /workspace
+git clone https://github.com/RoboTwin-Platform/RoboTwin.git -b RLinf_support
+cd RoboTwin
+bash script/_download_assets.sh
+```
+
+The `RLinf_support` branch is the RoboTwin fork that RLinf's env wrapper
+(`rlinf/envs/robotwin/robotwin_env.py`) targets. It pins API versions that
+match the wrapper's expectations.
+
+### 2. Generate expert demonstrations
+
+RoboTwin tasks come with deterministic planners (mplib / curobo). For a
+single task:
+
+```bash
+cd /workspace/RoboTwin
+# Example: 100 successful adjust_bottle trajectories with aloha-agilex.
+python script/run_task.py \
+    --task_name adjust_bottle \
+    --episode_num 100 \
+    --planner_backend mplib \
+    --embodiment aloha-agilex aloha-agilex 0.6 \
+    --save_path /workspace/data/robotwin-raw/adjust_bottle
+```
+
+Flag names may drift across RoboTwin versions; consult
+`RoboTwin/script/run_task.py --help` in the `RLinf_support` branch.
+The output is RoboTwin's native episode format (HDF5 + mp4).
+
+### 3. Convert RoboTwin -> LeRobot v2.1 Parquet
+
+RoboTwin's `RLinf_support` branch provides a LeRobot exporter. Point it
+at the raw folder:
+
+```bash
+cd /workspace/RoboTwin
+python script/convert_to_lerobot.py \
+    --input_dir  /workspace/data/robotwin-raw/adjust_bottle \
+    --output_dir /workspace/data/robotwin-lerobot/adjust_bottle \
+    --repo_id    robotwin/adjust_bottle \
+    --embodiment aloha-agilex
+```
+
+(Script name is the one RoboTwin currently ships as of the 2.0 release —
+check the repo for the exact entry point.)
+
+Expected output layout:
+
+```
+robotwin-lerobot/adjust_bottle/
+  meta/
+    info.json
+    episodes.jsonl
+    stats.json
+  data/chunk-000/
+    episode_000000.parquet
+    ...
+  videos/chunk-000/
+    observation.images.cam_high/
+    observation.images.cam_left_wrist/
+    observation.images.cam_right_wrist/
+```
+
+RLinf's `LeRobotAlohaDataConfig` expects these camera keys
+(`cam_high`, `cam_left_wrist`, `cam_right_wrist` in its RepackTransform).
+If the exporter produces a different naming, either pass
+`--camera_key_map` to the exporter or override the repack transform in
+`robotwin_aloha_dataconfig.py`.
+
+### 4. Point SFT at the converted data
+
+```yaml
+# examples/sft/config/robotwin_sft_drifting_openpi_pi05.yaml
+data:
+  train_data_paths: "/workspace/data/robotwin-lerobot/adjust_bottle"
+```
+
+### 5. Shortcut: pre-trained SFT checkpoints
+
+If you only want to verify the Stage-2 DBPO/BPO RL loop first and collect
+demos later, use one of RLinf's public SFT models on HuggingFace as the
+starting point:
+
+```bash
+pip install huggingface-hub
+# Pi0.5 + RoboTwin adjust_bottle, SFT'd on official expert data. No drifting.
+hf download RLinf/RLinf-Pi05-RoboTwin-SFT-adjust_bottle \
+    --local-dir /workspace/checkpoints/RLinf-Pi05-RoboTwin-SFT-adjust_bottle
+
+# For mainland China faster mirror:
+# export HF_ENDPOINT=https://hf-mirror.com
+```
+
+Note: these public checkpoints were SFT'd with flow matching, *not*
+drifting loss. They work as a Stage-2 starting point but the Stage-2
+deployment will not be strict 1-NFE — the model still expects multi-step
+flow denoising at inference. For true 1-NFE DBPO you must run Stage-1 with
+`use_drifting_loss: True`.
+
+### 6. Which RoboTwin tasks are usable
+
+RLinf currently ships env yamls for:
+
+```
+adjust_bottle, beat_block_hammer, click_bell, handover_block, lift_pot,
+move_can_pot, pick_dual_bottles, place_container_plate,
+place_empty_cup, place_shoe
+```
+
+(in `examples/embodiment/config/env/`). Our drift-dbpo-bpo configs cover
+`adjust_bottle` and `handover_block` — the two that overlap with openpi's
+drifting stage-1 configs. Any of the ten tasks above can be plugged in by
+copying one of the four provided yamls and changing the `env/robotwin_*@`
+references plus the `model_path`.
+
+Not listed: `shake_bottle`, `open_microwave`, `stack_bowls_two`,
+`put_object_cabinet`. These exist in RoboTwin itself but RLinf has not
+shipped env yamls for them yet. Adding one is mechanical — copy
+`examples/embodiment/config/env/robotwin_adjust_bottle.yaml` and change
+the `task_config.task_name` / `step_lim` fields.
+
+## JAX vs PyTorch drifting-loss parity
+
+RLinf only uses the PyTorch path, but for the record the two implementations
+in openpi (`openpi/models/drifting_util.py` and
+`openpi/models_pytorch/drifting_util.py`) are numerically equivalent. I
+diffed them line-by-line on `zj-humanoid-drifting` after the latest changes:
+
+* Same multi-scale R-list (`(0.02, 0.05, 0.2)`), same scale normalisation
+  (`sqrt(clip(scale / sqrt(S), 1e-3))`), same diagonal mask (block_mask with
+  mask_val=100), same softmax-symmetrisation
+  (`sqrt(softmax(logits, -1) * softmax(logits, -2))`), same force accumulator
+  divided by `sqrt(clip(f_norm, 1e-8))`, same MSE on
+  `(gen_scaled - stop_grad(goal_scaled))`.
+* The only divergence is stop-gradient placement: JAX uses
+  `jax.lax.stop_gradient(...)` at the goal and scale_inputs, PyTorch wraps
+  the goal construction in `torch.no_grad()` + `.detach()` at the MSE site.
+  These are equivalent.
+* Callers: JAX `_compute_loss_drifting` returns
+  `jnp.full((B, action_horizon), loss)` for compatibility with flow-matching
+  loss shape; PyTorch `_forward_drifting` returns `loss.mean().unsqueeze(0)`.
+  The reduced scalar is what the SFT trainer consumes, so the shape
+  difference does not leak.
+
+Bottom line: you can train with either backend and the decision boundary is
+the same.
+
