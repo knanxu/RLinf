@@ -1,6 +1,6 @@
-# DBPO + BPO (Bounded Policy Optimization) on RoboTwin Adjust Bottle.
+# DBPO + BPO (Bounded Policy Optimization) on RoboTwin handover_block.
 #
-# Same 1-NFE drift stochastic actor as robotwin_adjust_bottle_dbpo_openpi_pi05.yaml,
+# Same 1-NFE drift stochastic actor as robotwin_handover_block_dbpo_openpi_pi05.yaml,
 # but swaps PPO's clipped surrogate for BPO's advantage-weighted TV loss toward
 # the bounded-ratio analytic optimum (Ao et al. 2026, Eq. 16):
 #
@@ -11,8 +11,8 @@
 # replacement: tighter empirical KL, no dead zone outside the clip band.
 
 defaults:
-  - env/robotwin_adjust_bottle@env.train
-  - env/robotwin_adjust_bottle@env.eval
+  - env/robotwin_handover_block@env.train
+  - env/robotwin_handover_block@env.eval
   - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -35,7 +35,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "robotwin_adjust_bottle_dbpo_bpo_openpi_pi05"
+    experiment_name: "robotwin_handover_block_dbpo_bpo_openpi_pi05"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -111,8 +111,8 @@ env:
   train:
     total_num_envs: 256
     reward_coef: ${algorithm.reward_coef}
-    max_episode_steps: 200
-    max_steps_per_rollout_epoch: 200
+    max_episode_steps: 400
+    max_steps_per_rollout_epoch: 400
     group_size: ${algorithm.group_size}
     assets_path: "/path/to/robotwin_assets"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/train_seeds.json
@@ -133,9 +133,9 @@ env:
     total_num_envs: 128
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 200
+    max_episode_steps: 400
     reward_coef: ${algorithm.reward_coef}
-    max_steps_per_rollout_epoch: 200
+    max_steps_per_rollout_epoch: 400
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
@@ -177,7 +177,7 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "/path/to/openpi_drifting_ckpt/adjust_bottle"
+    model_path: "/path/to/openpi_drifting_ckpt/handover_block"
     num_action_chunks: 50
     action_dim: 14
     add_value_head: True
