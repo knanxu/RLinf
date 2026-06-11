@@ -39,16 +39,22 @@ liberoplus/liberopro suites). If env construction differs in your setup, only
 the build_env() helper needs editing.
 """
 import argparse
+import importlib.util
 import os
 import sys
 
 import numpy as np
 
+# Import speedup.py by FILE PATH so this diagnostic needs ONLY numpy + libero --
+# no RLinf package install (no omegaconf / ray / torch / openpi). The pure
+# functions used here (integrate_eef_deltas / so3_log) are numpy-only.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-from rlinf.envs.libero.speedup import integrate_eef_deltas, so3_log  # noqa: E402
+_SPEEDUP_PATH = os.path.join(_REPO_ROOT, "rlinf", "envs", "libero", "speedup.py")
+_spec = importlib.util.spec_from_file_location("_libero_speedup", _SPEEDUP_PATH)
+_speedup = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_speedup)
+integrate_eef_deltas = _speedup.integrate_eef_deltas
+so3_log = _speedup.so3_log
 
 
 def quat2mat_xyzw(q):
