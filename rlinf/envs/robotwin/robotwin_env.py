@@ -389,6 +389,96 @@ class RoboTwinEnv(gym.Env):
             infos_list,
         )
 
+    def chunk_step_with_speed(self, chunk_actions, speed_actions=None):
+        """speedup 版 chunk_step (opt-in, 不影响原 chunk_step).
+
+        用整段 TOPPRA + 每 env 的速度元动作 (v, vel_scale, acc_scale) 执行 chunk
+        (robotwin VectorEnv.step_with_speed -> Base_Task.gen_sparse_reward_data_speedup).
+        每 env 的加速执行细节在 infos["speedup"] 里 (status/dense_steps/duration/...),
+        供上层框架 (speedtune.execution / speed_control) 构建 ChunkExecResult 与速度奖励.
+
+        Args:
+            chunk_actions: [num_envs, chunk_step, action_dim].
+            speed_actions: [num_envs, 3] 的 (v, vel_scale, acc_scale); None -> 全 1.0 (P1b 默认).
+
+        后处理 (obs/reward/terminations/metrics/auto_reset) 与 chunk_step 一致.
+        """
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.cpu().numpy()
+
+        num_envs = chunk_actions.shape[0]
+        chunk_step = chunk_actions.shape[1]
+
+        if speed_actions is None:
+            speed_actions = np.ones((num_envs, 3), dtype=np.float32)
+        elif isinstance(speed_actions, torch.Tensor):
+            speed_actions = speed_actions.cpu().numpy()
+
+        obs_list = []
+        infos_list = []
+
+        raw_obs, step_reward, terminations, truncations, info_list = (
+            self.venv.step_with_speed(chunk_actions, speed_actions)
+        )
+        extracted_obs = self._extract_obs_image(raw_obs)
+        infos = list_of_dict_to_dict_of_list(info_list)
+        obs_list.append(extracted_obs)
+        infos_list.append(infos)
+        if isinstance(terminations, list):
+            terminations = torch.as_tensor(
+                np.array(terminations).reshape(-1), device=self.device
+            )
+        if isinstance(truncations, list):
+            truncations = torch.as_tensor(
+                np.array(truncations).reshape(-1), device=self.device
+            )
+
+        if self.use_custom_reward:
+            step_reward = self._calc_step_reward(terminations)
+        else:
+            if isinstance(step_reward, list):
+                step_reward = torch.as_tensor(
+                    np.array(step_reward, dtype=np.float32).reshape(-1),
+                    device=self.device,
+                )
+
+        chunk_rewards = self._cal_chunk_rewards(
+            step_reward, chunk_step, terminations, infos
+        )
+
+        self._elapsed_steps += chunk_actions.shape[1]
+        truncated = self._elapsed_steps >= self.cfg.max_episode_steps
+        if truncated.any():
+            truncations = torch.logical_or(truncated, truncations)
+
+        infos = self._record_metrics(step_reward, infos)
+
+        if self.ignore_terminations:
+            terminations[:] = False
+            if self.record_metrics:
+                if "success" in infos:
+                    infos["episode"]["success_at_end"] = infos["success"].clone()
+
+        past_dones = torch.logical_or(terminations, truncations)
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones, obs_list[-1], infos_list[-1]
+            )
+
+        chunk_terminations = torch.zeros((num_envs, chunk_step))
+        chunk_terminations[:, -1] = terminations
+
+        chunk_truncations = torch.zeros((num_envs, chunk_step))
+        chunk_truncations[:, -1] = truncations
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
     def _handle_auto_reset(self, dones, extracted_obs, infos):
         final_obs = extracted_obs.copy()
         env_idx = torch.arange(0, self.num_envs, device=self.device)[dones]
