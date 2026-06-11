@@ -11,12 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""robosuite / LIBERO 关节空间 TOPPRA 加速 —— worker 内执行 (方案 A).
+"""robosuite / LIBERO 关节空间 TOPPRA 加速 —— worker 内执行 (方案 1: 运行时 IK).
 
-实现 ``speedtune/docs/robosuite_toppra_design.md`` §8 step 1 的**版本无关骨架**:
-delta-EEF chunk → 绝对 EEF 路点 → 顺序 seed DLS IK → 关节路点 → ``retime_chunk``
-(复用 RoboTwin 同一 TOPPRA) → PD 兜底关节执行 → RoboTwin 兼容 info dict
-(经 ``speedtune.execution.robotwin_executor.result_from_speedup_info`` 转 ChunkExecResult).
+实现 ``speedtune/docs/robosuite_toppra_design.md`` 方案的**版本无关骨架**:
+delta-EEF chunk → 积分绝对 EEF 路点 → 顺序 seed DLS IK → 绝对关节路点
+→ **关节空间压缩 (v, = RoboTwin 语义, 见 ``compress_joint_path``)**
+→ ``retime_chunk`` (复用 RoboTwin 同一 TOPPRA) → PD 兜底关节执行
+→ RoboTwin 兼容 info dict (经 ``robotwin_executor.result_from_speedup_info`` 转 ChunkExecResult).
+
+为什么用 IK 而非 "sim 回放录关节轨迹": 后者要快照/还原 sim, **实机不可能**, 且依赖完美
+前向仿真. IK 只需 URDF 运动学, sim/真机一致, 可部署. 代价是近奇异/不可达时 IK 可能失败
+→ 回退 native OSC 原速执行 (任务不受损, 只是这段不加速), 见编排器 ``_native_fallback``.
+
+压缩**必须在 IK 之后**作用于绝对关节路点: LIBERO 动作是 EEF-**delta**, 直接重采样会丢位移;
+积分 + IK 成绝对关节路点后再压缩, 才和 RoboTwin (作用于绝对关节角) 语义一致.
 
 设计约束 (见设计文档 §2):
     LIBERO ``venv.py`` 是多进程 worker, robosuite env 活在子进程. 关节执行必须在
@@ -24,7 +32,8 @@ delta-EEF chunk → 绝对 EEF 路点 → 顺序 seed DLS IK → 关节路点 �
     本模块即那段 "worker 内纯函数", 不持有 env, 所有句柄经参数传入.
 
 本地可测 vs 云端待定:
-    * 纯函数 (``so3_exp`` / ``so3_log`` / ``integrate_eef_deltas``): 仅依赖 numpy, CPU 可单测.
+    * 纯函数 (``so3_exp`` / ``so3_log`` / ``integrate_eef_deltas`` / ``compress_joint_path``):
+      仅依赖 numpy (+ speedtune.reconstruct_chunk), CPU 可单测.
     * mujoco IK / PD 执行 / 编排: 依赖 mujoco + robosuite env, 本地无 mujoco, 只写不跑.
     * 标注 ``TODO(cloud)`` 的是设计文档 §7 必须在云端核实后才能定稿的 robosuite 专属细节
       (控制器 API / OSC output_max / 关节 vel-acc 限制来源 / site 与执行器索引).
@@ -291,6 +300,33 @@ def execute_joint_trajectory_pd(
 # ---------------------------------------------------------------------------
 
 
+def compress_joint_path(
+    q_path: np.ndarray, grippers: np.ndarray, v: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """按 v 压缩 IK 出的**绝对关节路点** (= RoboTwin 语义).
+
+    关键: 压缩必须作用在**绝对量**上. delta-EEF 直接重采样会丢位移 (v=2 少走一半),
+    所以先积分 + IK 成绝对关节路点, 再在这里压缩 —— 此时和 RoboTwin 的
+    ``reconstruct_chunk`` (作用于绝对关节角 chunk) 一字不差.
+
+    Args:
+        q_path:   (N, dof_arm) 绝对关节路点.
+        grippers: (N,) 或 (N, g) gripper 指令.
+        v:        压缩比率 (>1 聚合, <1 插帧, =1 不变).
+
+    Returns:
+        q_c:       (M, dof_arm) 压缩后关节路点, M = floor((N-1)/v)+1.
+        grip_c:    (M, g) 同步压缩的 gripper.
+    """
+    from speedtune.execution.chunk_ops import reconstruct_chunk
+
+    q_path = np.asarray(q_path, dtype=np.float64)
+    grippers = np.asarray(grippers, dtype=np.float64).reshape(q_path.shape[0], -1)
+    if v == 1.0:
+        return q_path, grippers
+    return reconstruct_chunk(q_path, v), reconstruct_chunk(grippers, v)
+
+
 def _default_retime_fn():
     """懒加载 RoboTwin 的 retime_chunk (复用同一 TOPPRA, 设计文档 §3 第 4 步)."""
     from robotwin.envs.robot.toppra_chunk_executor import retime_chunk  # TODO(cloud): 确认 import 路径
@@ -326,54 +362,68 @@ def chunk_step_speedup_single_env(
     check_success: Optional[Callable[[], bool]] = None,
     exec_hz: int = 20,
     retime_fn: Optional[Callable] = None,
+    native_execute_fn: Optional[Callable[[np.ndarray], Tuple[int, bool]]] = None,
 ) -> dict:
     """单 env 加速执行一段 delta-EEF chunk, 返回 RoboTwin take_chunk_action 兼容 info.
 
-    流水线 (设计文档 §3): [v 压缩] → 积分 EEF 路点 → 顺序 IK → retime_chunk →
-    PD 执行. 任一环节失败 → ``status="topp_fallback"``, 预算照扣 M (坏 scale 负信号).
+    流水线 (方案 1, 设计文档 §3 + Q1 修正):
+        积分整段 delta → 绝对 EEF 路点 → 顺序 seed IK → 绝对关节路点
+        → **在关节空间压缩 (v, = RoboTwin 语义)** → retime_chunk(vel/acc_scale)
+        → PD 关节执行.
+
+    压缩**必须在 IK 之后**作用于绝对关节路点: delta-EEF 直接重采样会丢位移 (见
+    ``compress_joint_path``).
+
+    Fallback (设计文档 §6): IK 不收敛 / TOPPRA 失败 → 回退到 ``native_execute_fn``
+    原速 OSC 执行整段, 保证任务不受损, ``status="topp_fallback"`` (上层屏蔽 r_speed),
+    预算扣满 N (原速跑完整段). 即 "IK 失败 ≠ 任务失败, 只 = 这段不加速".
 
     info dict 键对齐 ``speedtune.execution.robotwin_executor.result_from_speedup_info``:
-        ``status`` ∈ {success, topp_fallback, truncated},
-        ``dense_steps`` (sim 步数), ``take_action_cnt_delta`` (= 压缩后帧数 M, 预算消耗),
-        ``duration`` (TOPPRA 时长 = exec_time 来源), ``fallback_reason``.
+        ``status`` ∈ {success, topp_fallback}, ``dense_steps`` (sim 步数),
+        ``take_action_cnt_delta`` (success=压缩后 M / fallback=N, 预算消耗),
+        ``duration`` (exec_time 来源), ``fallback_reason``, ``success_obs``.
 
-    本函数是 §8 step 1 的版本无关编排骨架; 标 ``TODO(cloud)`` 的句柄/参数需在 venv worker
-    内由 robosuite env 解析后传入 (§8 step 2-3, 另行接线).
+    标 ``TODO(cloud)`` 的句柄/参数 (site/索引/output_max/关节限制/控制器) 需在 venv
+    worker 内由 robosuite env 解析后传入 (§8 step 2-3 接线, §7 云端核实).
     """
-    from speedtune.execution.chunk_ops import reconstruct_chunk
-
     v, vel_scale, acc_scale = float(speed_action[0]), float(speed_action[1]), float(speed_action[2])
     retime_fn = retime_fn or _default_retime_fn()
+    delta_chunk = np.asarray(delta_chunk, dtype=np.float64)
+    N = delta_chunk.shape[0]
 
-    # 1) v 压缩 (纯动作序列重采样, 通用算子). M = 压缩后帧数, 即预算消耗.
-    chunk = np.asarray(delta_chunk, dtype=np.float64)
-    if v != 1.0:
-        chunk = reconstruct_chunk(chunk, v)
-    M = chunk.shape[0]
-
-    def _fallback(reason: str) -> dict:
+    def _native_fallback(reason: str) -> dict:
+        # IK / TOPPRA 失败 → 原速 native OSC 执行整段 (任务不受损), r_speed 由上层屏蔽.
+        if native_execute_fn is not None:
+            steps, success = native_execute_fn(delta_chunk)
+        else:
+            steps, success = 0, False
         return {
             "status": "topp_fallback",
             "fallback_reason": reason,
-            "duration": 0.0,
-            "dense_steps": 0,
-            "take_action_cnt_delta": M,
+            "duration": float(steps) / float(exec_hz) if steps else 0.0,
+            "dense_steps": int(steps),
+            "take_action_cnt_delta": N,        # 原速跑完整段, 扣满 N
+            "success_obs": bool(success),
         }
 
-    # 2) 积分绝对 EEF 路点 (纯函数)
+    # 1) 积分**整段** delta → 绝对 EEF 路点 (绝不在 delta 上压缩)
     positions, rotmats, grippers = integrate_eef_deltas(
-        eef_pos, eef_rotmat, chunk, pos_output_max, rot_output_max
+        eef_pos, eef_rotmat, delta_chunk, pos_output_max, rot_output_max
     )
 
-    # 3) 顺序 seed IK → 关节路点
+    # 2) 顺序 seed IK → 绝对关节路点 (N 个)
     q_path, ik_ok = dls_ik_sequential(
         model, scratch_data, site_id, arm_qpos_adr, arm_dof_adr,
         positions, rotmats, q_seed=q_cur_arm, jnt_range=jnt_range,
     )
     if not ik_ok:
-        return _fallback("ik_failed")
+        return _native_fallback("ik_failed")
 
-    # 4) retime_chunk (复用 RoboTwin TOPPRA, 关节空间, vel/acc_scale 同义)
+    # 3) 在**绝对关节路点**上压缩 (= RoboTwin 语义). M = 压缩后帧数 = 预算消耗.
+    q_path, grippers = compress_joint_path(q_path, grippers, v)
+    M = q_path.shape[0]
+
+    # 4) retime_chunk (复用 RoboTwin 关节空间 TOPPRA, vel/acc_scale 同义)
     retimed = retime_fn(
         current_state_arm=np.asarray(q_cur_arm, dtype=np.float64),
         chunk_arm=q_path,
@@ -386,9 +436,9 @@ def chunk_step_speedup_single_env(
         exec_hz=exec_hz,
     )
     if retimed.get("status") != "success":
-        return _fallback(f"toppra_{retimed.get('return_code', 'fail')}")
+        return _native_fallback(f"toppra_{retimed.get('return_code', 'fail')}")
 
-    # 5) PD 兜底执行
+    # 5) 关节执行 (PD 兜底)
     exec_steps, success = execute_joint_trajectory_pd(
         sim, arm_qpos_adr, arm_qvel_adr, arm_actuator_ids,
         dense_q=retimed["dense_arm_pos"],
